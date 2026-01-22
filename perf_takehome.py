@@ -490,10 +490,12 @@ class KernelBuilder:
         inp_values_addr = self.alloc_scratch("inp_values_addr")
 
         # Temp vectors for unrolling
-        UNROLL_FACTOR = 32
+        UNROLL_FACTOR = 16
         tmp_node_vals = [self.alloc_scratch_vec(f"tmp_node_val_{k}") for k in range(UNROLL_FACTOR)]
         tmp1s = [self.alloc_scratch_vec(f"tmp1_{k}") for k in range(UNROLL_FACTOR)]
         tmp3s = [self.alloc_scratch_vec(f"tmp3_{k}") for k in range(UNROLL_FACTOR)]
+        tmp2s = [self.alloc_scratch_vec(f"tmp2_{k}") for k in range(UNROLL_FACTOR)]
+        tmp4s = [self.alloc_scratch_vec(f"tmp4_{k}") for k in range(UNROLL_FACTOR)]
 
         # Address registers for unrolled gather (scalar)
         # Reuse tmp1s as address registers to save space
@@ -536,14 +538,18 @@ class KernelBuilder:
 
         self.instrs.extend(self.pack_slots(prologue))
 
-        mux_pool = [self.alloc_scratch_vec(f"mux_{k}") for k in range(4)]
+        # Increase pool size to support up to Round 3 (8 values)
+        mux_pool = [self.alloc_scratch_vec(f"mux_{k}") for k in range(8)]
         for round in range(rounds):
-            # Pre-load tree values for Mux (Round 0-2)
+            eff_round = round % (forest_height + 1)
+            # Use Mux for Rounds 0, 1 (and 11, 12)
+            use_mux = eff_round <= 1
+
+            # Pre-load tree values for Mux
             mux_vals = []
-            use_mux = round <= 1
             if use_mux:
-                base_idx = (1 << round) - 1
-                count = 1 << round
+                base_idx = (1 << eff_round) - 1
+                count = 1 << eff_round
                 for k in range(count):
                     k_const = self.scratch_const(base_idx + k)
                     # Reuse tmp_addr and tmp_val for loading
@@ -573,31 +579,60 @@ class KernelBuilder:
                     tmp_node_val_u = tmp_node_vals[u]
                     tmp1_u = tmp1s[u]
                     tmp3_u = tmp3s[u]
+                    tmp2_u = tmp2s[u]
+                    tmp4_u = tmp4s[u]
 
                     if use_mux:
                         current_vals = list(mux_vals)
 
-                        def emit_valu_select(dest, mask, a, b):
+                        def emit_flow_select(dest, mask, a, b):
                             # dest = a if mask!=0 else b
-                            # Optimized: dest = b + mask * (a - b)  (Assuming mask is 0 or 1)
-                            # Ops: dest = a - b; dest = multiply_add(mask, dest, b)
-                            # Wait: (a-b)*mask + b.
-                            # If mask=1: a-b+b = a.
-                            # If mask=0: 0+b = b.
-                            # Correct.
-                            ops_loads.append(("valu", ("-", dest, a, b)))
-                            ops_loads.append(("valu", ("multiply_add", dest, mask, dest, b)))
+                            # Using vselect: dest, cond, a, b
+                            ops_loads.append(("flow", ("vselect", dest, mask, a, b)))
 
-                        # Round 0: 1 val. Direct copy.
-                        if len(current_vals) == 1:
-                            tmp_node_val_u = current_vals[0]
+                        # Recursive helper to build selection tree
+                        def build_select(vals, bit_index, avail_regs):
+                            if len(vals) == 1:
+                                return vals[0]
 
-                        # Round 1: 2 vals.
-                        elif len(current_vals) == 2:
-                            mask_vec = self.scratch_const_vec(1)
-                            # Compute Mask 0 in tmp1
-                            ops_loads.append(("valu", ("&", tmp1_u, curr_idx_vec, mask_vec)))
-                            emit_valu_select(tmp_node_val_u, tmp1_u, current_vals[0], current_vals[1])
+                            mid = len(vals) // 2
+                            vals0 = vals[:mid] # Corresponds to mask=0
+                            vals1 = vals[mid:] # Corresponds to mask=1
+
+                            dest = avail_regs[0]
+                            inner_regs = avail_regs[1:]
+
+                            L = build_select(vals0, bit_index - 1, inner_regs)
+
+                            used_by_L = 1 if len(vals0) > 1 else 0
+                            R = build_select(vals1, bit_index - 1, inner_regs[used_by_L:])
+
+                            base_val = (1 << eff_round) - 1
+                            base_const = self.scratch_const_vec(base_val)
+
+                            # mask = (idx - base) >> bit_index & 1
+                            # Reuse dest for mask
+                            ops_loads.append(("valu", ("-", dest, curr_idx_vec, base_const)))
+                            if bit_index > 0:
+                                shift_const = self.scratch_const_vec(bit_index)
+                                ops_loads.append(("valu", (">>", dest, dest, shift_const)))
+
+                            mask_const = self.scratch_const_vec(1)
+                            ops_loads.append(("valu", ("&", dest, dest, mask_const)))
+
+                            emit_flow_select(dest, dest, R, L)
+                            return dest
+
+                        # Available temps: tmp_node_val_u, tmp1_u, tmp2_u, tmp3_u, tmp4_u
+                        regs = [tmp_node_val_u, tmp1_u, tmp2_u, tmp3_u, tmp4_u]
+
+                        import math
+                        top_bit = int(math.log2(len(current_vals))) - 1
+
+                        res = build_select(current_vals, top_bit, regs)
+                        if res != tmp_node_val_u:
+                             ops_loads.append(("valu", ("+", tmp_node_val_u, res, zero_vec)))
+
                     else:
                         # node_val_vec gather
                         for k in range(VLEN):
