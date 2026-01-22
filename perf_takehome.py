@@ -441,8 +441,8 @@ class KernelBuilder:
         Vectorized kernel implementation with unrolling and scratch buffer optimization.
         """
         tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
+        tmp2 = tmp1 # self.alloc_scratch("tmp2")
+        tmp3 = tmp1 # self.alloc_scratch("tmp3")
         # Scratch space addresses
         init_vars = [
             "rounds",
@@ -479,22 +479,17 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
-        inp_indices_addr = self.alloc_scratch("inp_indices_addr")
-        inp_values_addr = self.alloc_scratch("inp_values_addr")
+        # Scalar scratch registers (aliased to tmp1 to save space where liveness permits)
+        # tmp_idx and tmp_val are unused in current implementation
+        tmp_node_val = tmp1
+        tmp_addr = tmp1
 
         # Temp vectors for unrolling
-        UNROLL_FACTOR = 32
+        UNROLL_FACTOR = 24
         tmp_node_vals = [self.alloc_scratch_vec(f"tmp_node_val_{k}") for k in range(UNROLL_FACTOR)]
         tmp1s = [self.alloc_scratch_vec(f"tmp1_{k}") for k in range(UNROLL_FACTOR)]
-        # Reuse tmp_node_vals for tmp2 to save scratch space
-        tmp2s = tmp_node_vals
-        # Reuse tmp1 for tmp3 to save scratch space
-        tmp3s = tmp1s
+        tmp2s = [self.alloc_scratch_vec(f"tmp2_{k}") for k in range(UNROLL_FACTOR)]
+        tmp3s = [self.alloc_scratch_vec(f"tmp3_{k}") for k in range(UNROLL_FACTOR)]
 
         # Address registers for unrolled gather (scalar)
         # Reuse tmp1s as address registers to save space
@@ -509,8 +504,7 @@ class KernelBuilder:
         val_buf = self.alloc_scratch("val_buf", length=batch_size)
 
         vector_loops = batch_size // VLEN
-        unrolled_loops = vector_loops // UNROLL_FACTOR
-        remainder_start = unrolled_loops * UNROLL_FACTOR * VLEN
+        remainder_start = vector_loops * VLEN
 
         # Prologue: Load all data from memory to scratch buffers
         prologue = []
@@ -536,7 +530,7 @@ class KernelBuilder:
         for round in range(rounds):
             # Pre-load tree values for Mux (Round 0-2)
             mux_vals = []
-            use_mux = round <= 1
+            use_mux = round <= 2
             if use_mux:
                 base_idx = (1 << round) - 1
                 count = 1 << round
@@ -550,15 +544,16 @@ class KernelBuilder:
                     body.append(("valu", ("vbroadcast", val_vec, val_scalar)))
                     mux_vals.append(val_vec)
 
-            for vui in range(unrolled_loops):
-                vi_base = vui * UNROLL_FACTOR
+            vi_base = 0
+            while vi_base < vector_loops:
+                chunk_size = min(UNROLL_FACTOR, vector_loops - vi_base)
 
                 ops_addrs = []
                 ops_loads = []
                 ops_hashes = []
                 ops_updates = []
 
-                for u in range(UNROLL_FACTOR):
+                for u in range(chunk_size):
                     vi = vi_base + u
                     i = vi * VLEN
 
@@ -615,9 +610,6 @@ class KernelBuilder:
                             ops_loads.append(("valu", ("&", tmp2_u, tmp1_u, mask_vec)))
 
                             # Final select
-                            # Note: flow limit 1. This pipeline will stall if 2 vselects in parallel.
-                            # But we have 32 vectors. Scheduler will interleave.
-                            # Also consider using VALU select if needed. But let's try flow first.
                             ops_loads.append(("flow", ("vselect", tmp_node_val_u, tmp2_u, tmp_node_val_u, tmp3_u)))
 
                     else:
@@ -634,11 +626,13 @@ class KernelBuilder:
 
                     # Vectorized index update
                     # inc = 1 + (val & 1)
+                    # tmp1_u = val & 1
+                    # idx = idx * 2 + (1 + tmp1_u)
+                    # We use multiply_add(idx, 2, 1) -> idx*2+1
+                    # Then add tmp1_u
                     ops_updates.append(("valu", ("&", tmp1_u, curr_val_vec, one_vec)))
-                    ops_updates.append(("valu", ("+", tmp3_u, one_vec, tmp1_u)))
-
-                    ops_updates.append(("valu", ("*", curr_idx_vec, curr_idx_vec, two_vec)))
-                    ops_updates.append(("valu", ("+", curr_idx_vec, curr_idx_vec, tmp3_u)))
+                    ops_updates.append(("valu", ("multiply_add", curr_idx_vec, curr_idx_vec, two_vec, one_vec)))
+                    ops_updates.append(("valu", ("+", curr_idx_vec, curr_idx_vec, tmp1_u)))
 
                     # Wrap: idx = idx * (idx < n_nodes)
                     # Optimization: Only needed if max_idx could exceed n_nodes
@@ -651,6 +645,8 @@ class KernelBuilder:
                 body.extend(ops_loads)
                 body.extend(ops_hashes)
                 body.extend(ops_updates)
+
+                vi_base += chunk_size
 
             # Scalar remainder loop
             for i in range(remainder_start, batch_size):
