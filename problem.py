@@ -124,6 +124,10 @@ class Machine:
         }
         if trace:
             self.setup_trace()
+            self.addr_to_scratch_start_addr = {}
+            for addr, (name, length) in self.debug_info.scratch_map.items():
+                for i in range(length):
+                    self.addr_to_scratch_start_addr[addr + i] = addr
         else:
             self.trace = None
 
@@ -343,13 +347,18 @@ class Machine:
 
     def trace_post_step(self, instr, core):
         # You can add extra stuff to the trace if you want!
-        for addr, (name, length) in self.debug_info.scratch_map.items():
-            if any((addr + vi) in self.scratch_write for vi in range(length)):
-                val = str(core.scratch[addr : addr + length])
-                val = val.replace("[", "").replace("]", "")
-                self.trace.write(
-                    f'{{"name": "{val}", "cat": "op", "ph": "X", "pid": {len(self.cores) + core.id}, "tid": {BASE_ADDR_TID + addr}, "ts": {self.cycle}, "dur": 1 }},\n'
-                )
+        modified_scratch_addrs = set()
+        for written_addr in self.scratch_write:
+            if written_addr in self.addr_to_scratch_start_addr:
+                modified_scratch_addrs.add(self.addr_to_scratch_start_addr[written_addr])
+
+        for addr in modified_scratch_addrs:
+            name, length = self.debug_info.scratch_map[addr]
+            val = str(core.scratch[addr : addr + length])
+            val = val.replace("[", "").replace("]", "")
+            self.trace.write(
+                f'{{"name": "{val}", "cat": "op", "ph": "X", "pid": {len(self.cores) + core.id}, "tid": {BASE_ADDR_TID + addr}, "ts": {self.cycle}, "dur": 1 }},\n'
+            )
 
     def trace_slot(self, core, slot, name, i):
         self.trace.write(
