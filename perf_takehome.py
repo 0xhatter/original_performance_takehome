@@ -493,10 +493,7 @@ class KernelBuilder:
         UNROLL_FACTOR = 32
         tmp_node_vals = [self.alloc_scratch_vec(f"tmp_node_val_{k}") for k in range(UNROLL_FACTOR)]
         tmp1s = [self.alloc_scratch_vec(f"tmp1_{k}") for k in range(UNROLL_FACTOR)]
-        # Reuse tmp_node_vals for tmp2 to save scratch space
-        tmp2s = tmp_node_vals
-        # Reuse tmp1 for tmp3 to save scratch space
-        tmp3s = tmp1s
+        tmp3s = [self.alloc_scratch_vec(f"tmp3_{k}") for k in range(UNROLL_FACTOR)]
 
         # Address registers for unrolled gather (scalar)
         # Reuse tmp1s as address registers to save space
@@ -539,6 +536,7 @@ class KernelBuilder:
 
         self.instrs.extend(self.pack_slots(prologue))
 
+        mux_pool = [self.alloc_scratch_vec(f"mux_{k}") for k in range(4)]
         for round in range(rounds):
             # Pre-load tree values for Mux (Round 0-2)
             mux_vals = []
@@ -548,12 +546,11 @@ class KernelBuilder:
                 count = 1 << round
                 for k in range(count):
                     k_const = self.scratch_const(base_idx + k)
-                    addr_reg = self.alloc_scratch()
-                    body.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], k_const)))
-                    val_scalar = self.alloc_scratch()
-                    body.append(("load", ("load", val_scalar, addr_reg)))
-                    val_vec = self.alloc_scratch_vec()
-                    body.append(("valu", ("vbroadcast", val_vec, val_scalar)))
+                    # Reuse tmp_addr and tmp_val for loading
+                    body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], k_const)))
+                    body.append(("load", ("load", tmp_val, tmp_addr)))
+                    val_vec = mux_pool[k]
+                    body.append(("valu", ("vbroadcast", val_vec, tmp_val)))
                     mux_vals.append(val_vec)
 
             for vui in range(unrolled_loops):
@@ -575,55 +572,32 @@ class KernelBuilder:
                     # Temps for this unrolled iteration
                     tmp_node_val_u = tmp_node_vals[u]
                     tmp1_u = tmp1s[u]
-                    tmp2_u = tmp2s[u]
                     tmp3_u = tmp3s[u]
 
                     if use_mux:
                         current_vals = list(mux_vals)
 
-                        # Round 0: 1 val. Direct copy to tmp_node_val_u.
+                        def emit_valu_select(dest, mask, a, b):
+                            # dest = a if mask!=0 else b
+                            # Optimized: dest = b + mask * (a - b)  (Assuming mask is 0 or 1)
+                            # Ops: dest = a - b; dest = multiply_add(mask, dest, b)
+                            # Wait: (a-b)*mask + b.
+                            # If mask=1: a-b+b = a.
+                            # If mask=0: 0+b = b.
+                            # Correct.
+                            ops_loads.append(("valu", ("-", dest, a, b)))
+                            ops_loads.append(("valu", ("multiply_add", dest, mask, dest, b)))
+
+                        # Round 0: 1 val. Direct copy.
                         if len(current_vals) == 1:
-                            # Optimize: Alias tmp_node_val_u to the constant register to avoid Move
                             tmp_node_val_u = current_vals[0]
 
-                        # Round 1: 2 vals. 1 select.
-                        # Optimize: Use (idx & 1) instead of (idx - base).
-                        # Node 1 (idx odd) -> 1. Node 2 (idx even) -> 0.
-                        # vselect(cond, A, B). 1->A, 0->B.
-                        # We want Node 1 (vals[0]) if 1. Node 2 (vals[1]) if 0.
+                        # Round 1: 2 vals.
                         elif len(current_vals) == 2:
                             mask_vec = self.scratch_const_vec(1)
-                            ops_loads.append(("valu", ("&", tmp2_u, curr_idx_vec, mask_vec)))
-                            ops_loads.append(("flow", ("vselect", tmp_node_val_u, tmp2_u, current_vals[0], current_vals[1])))
-
-                        # Round 2: 4 vals.
-                        # Layer 1 (bit 0): (0,1)->tmp3_u, (2,3)->tmp_node_val_u
-                        # Layer 2 (bit 1): (tmp3_u, tmp_node_val_u)->tmp_node_val_u
-                        elif len(current_vals) == 4:
-                            # Restore offset calculation for generic case
-                            base_idx_vec = self.scratch_const_vec((1 << round) - 1)
-                            ops_loads.append(("valu", ("-", tmp1_u, curr_idx_vec, base_idx_vec)))
-
-                            # Bit 0
-                            mask_vec = self.scratch_const_vec(1)
-                            ops_loads.append(("valu", ("&", tmp2_u, tmp1_u, mask_vec)))
-
-                            # Select low pair -> tmp3_u
-                            ops_loads.append(("flow", ("vselect", tmp3_u, tmp2_u, current_vals[1], current_vals[0])))
-
-                            # Select high pair -> tmp_node_val_u
-                            ops_loads.append(("flow", ("vselect", tmp_node_val_u, tmp2_u, current_vals[3], current_vals[2])))
-
-                            # Bit 1
-                            mask_vec = self.scratch_const_vec(2)
-                            ops_loads.append(("valu", ("&", tmp2_u, tmp1_u, mask_vec)))
-
-                            # Final select
-                            # Note: flow limit 1. This pipeline will stall if 2 vselects in parallel.
-                            # But we have 32 vectors. Scheduler will interleave.
-                            # Also consider using VALU select if needed. But let's try flow first.
-                            ops_loads.append(("flow", ("vselect", tmp_node_val_u, tmp2_u, tmp_node_val_u, tmp3_u)))
-
+                            # Compute Mask 0 in tmp1
+                            ops_loads.append(("valu", ("&", tmp1_u, curr_idx_vec, mask_vec)))
+                            emit_valu_select(tmp_node_val_u, tmp1_u, current_vals[0], current_vals[1])
                     else:
                         # node_val_vec gather
                         for k in range(VLEN):
@@ -634,7 +608,7 @@ class KernelBuilder:
 
                     # Vectorized hash
                     ops_hashes.append(("valu", ("^", curr_val_vec, curr_val_vec, tmp_node_val_u)))
-                    ops_hashes.extend(self.build_hash_vector(curr_val_vec, tmp1_u, tmp2_u, round, i))
+                    ops_hashes.extend(self.build_hash_vector(curr_val_vec, tmp1_u, tmp3_u, round, i))
 
                     # Vectorized index update
                     # inc = 1 + (val & 1)
