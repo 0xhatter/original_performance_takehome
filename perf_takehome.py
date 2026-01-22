@@ -37,6 +37,144 @@ from problem import (
 )
 
 
+def get_rw(engine, slot):
+    reads = set()
+    writes = set()
+    mem_read = False
+    mem_write = False
+
+    if engine == 'alu':
+        # (op, dest, a1, a2)
+        op, dest, a1, a2 = slot
+        writes.add(dest)
+        reads.add(a1)
+        reads.add(a2)
+
+    elif engine == 'valu':
+        op = slot[0]
+        if op == 'vbroadcast':
+            # (vbroadcast, dest, src)
+            _, dest, src = slot
+            for i in range(VLEN):
+                writes.add(dest + i)
+            reads.add(src)
+        elif op == 'multiply_add':
+            # (multiply_add, dest, a, b, c)
+            _, dest, a, b, c = slot
+            for i in range(VLEN):
+                writes.add(dest + i)
+                reads.add(a + i)
+                reads.add(b + i)
+                reads.add(c + i)
+        else:
+            # (op, dest, a1, a2)
+            _, dest, a1, a2 = slot
+            for i in range(VLEN):
+                writes.add(dest + i)
+                reads.add(a1 + i)
+                reads.add(a2 + i)
+
+    elif engine == 'load':
+        op = slot[0]
+        if op == 'load':
+            # (load, dest, addr)
+            _, dest, addr = slot
+            writes.add(dest)
+            reads.add(addr)
+            mem_read = True
+        elif op == 'load_offset':
+            # (load_offset, dest, addr, offset)
+            _, dest, addr, offset = slot
+            writes.add(dest + offset)
+            reads.add(addr + offset)
+            mem_read = True
+        elif op == 'vload':
+            # (vload, dest, addr)
+            _, dest, addr = slot
+            for i in range(VLEN):
+                writes.add(dest + i)
+            reads.add(addr)
+            mem_read = True
+        elif op == 'const':
+            # (const, dest, val)
+            _, dest, val = slot
+            writes.add(dest)
+
+    elif engine == 'store':
+        op = slot[0]
+        if op == 'store':
+            # (store, addr, src)
+            _, addr, src = slot
+            reads.add(addr)
+            reads.add(src)
+            mem_write = True
+        elif op == 'vstore':
+            # (vstore, addr, src)
+            _, addr, src = slot
+            reads.add(addr)
+            for i in range(VLEN):
+                reads.add(src + i)
+            mem_write = True
+
+    elif engine == 'flow':
+        op = slot[0]
+        if op == 'select':
+            # (select, dest, cond, a, b)
+            _, dest, cond, a, b = slot
+            writes.add(dest)
+            reads.add(cond)
+            reads.add(a)
+            reads.add(b)
+        elif op == 'add_imm':
+            # (add_imm, dest, a, imm)
+            _, dest, a, imm = slot
+            writes.add(dest)
+            reads.add(a)
+        elif op == 'vselect':
+            # (vselect, dest, cond, a, b)
+            _, dest, cond, a, b = slot
+            for i in range(VLEN):
+                writes.add(dest + i)
+                reads.add(cond + i)
+                reads.add(a + i)
+                reads.add(b + i)
+        elif op == 'cond_jump':
+            # (cond_jump, cond, addr)
+            _, cond, addr = slot
+            reads.add(cond)
+        elif op == 'cond_jump_rel':
+            # (cond_jump_rel, cond, offset)
+            _, cond, offset = slot
+            reads.add(cond)
+        elif op == 'jump_indirect':
+            # (jump_indirect, addr)
+            _, addr = slot
+            reads.add(addr)
+        elif op == 'trace_write':
+            # (trace_write, val)
+            _, val = slot
+            reads.add(val)
+        elif op == 'coreid':
+            # (coreid, dest)
+            _, dest = slot
+            writes.add(dest)
+        # jump, halt, pause: no regs
+
+    elif engine == 'debug':
+        op = slot[0]
+        if op == 'compare':
+            # (compare, val, key)
+            _, val, key = slot
+            reads.add(val)
+        elif op == 'vcompare':
+            # (vcompare, val, keys)
+            _, val, keys = slot
+            for i in range(VLEN):
+                reads.add(val + i)
+
+    return reads, writes, mem_read, mem_write
+
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -48,11 +186,66 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
+        # Greedy slot packing respecting dependencies and slot limits
         instrs = []
+
+        if not vliw:
+            for engine, slot in slots:
+                instrs.append({engine: [slot]})
+            return instrs
+
+        current_bundle = defaultdict(list)
+        bundle_reads = set()
+        bundle_writes = set()
+        bundle_mem_write = False
+
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            reads, writes, mem_read, mem_write = get_rw(engine, slot)
+
+            # Check for conflicts
+            conflict = False
+
+            # 1. Slot limits
+            if len(current_bundle[engine]) >= SLOT_LIMITS[engine]:
+                conflict = True
+
+            # 2. RAW: Reads intersect with bundle writes
+            if not conflict and not reads.isdisjoint(bundle_writes):
+                conflict = True
+
+            # 3. WAW: Writes intersect with bundle writes
+            if not conflict and not writes.isdisjoint(bundle_writes):
+                conflict = True
+
+            # 4. Memory RAW: Reading memory after a store in same bundle
+            if not conflict and mem_read and bundle_mem_write:
+                conflict = True
+
+            # 5. Memory WAW: Writing memory after a store in same bundle
+            if not conflict and mem_write and bundle_mem_write:
+                conflict = True
+
+            if conflict:
+                # Flush current bundle
+                if current_bundle:
+                    instrs.append(dict(current_bundle))
+                current_bundle = defaultdict(list)
+                bundle_reads = set()
+                bundle_writes = set()
+                bundle_mem_write = False
+
+            # Add to bundle
+            current_bundle[engine].append(slot)
+            bundle_reads.update(reads)
+            bundle_writes.update(writes)
+            if mem_write:
+                bundle_mem_write = True
+
+        # Flush final bundle
+        if current_bundle:
+            instrs.append(dict(current_bundle))
+
         return instrs
 
     def add(self, engine, slot):
