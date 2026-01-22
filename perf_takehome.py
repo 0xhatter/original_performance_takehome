@@ -38,8 +38,8 @@ from problem import (
 )
 
 def get_rw(engine, slot):
-    reads = set()
-    writes = set()
+    reads = None
+    writes = None
     mem_read = False
     mem_write = False
     op = slot[0]
@@ -47,21 +47,21 @@ def get_rw(engine, slot):
     if engine == 'alu':
         # (op, dest, a1, a2)
         op, dest, a1, a2 = slot
-        writes.add(dest)
-        reads.add(a1)
-        reads.add(a2)
+        writes = {dest}
+        reads = {a1, a2}
 
     elif engine == 'valu':
         op = slot[0]
         if op == 'vbroadcast':
             # (vbroadcast, dest, src)
             _, dest, src = slot
-            for i in range(VLEN):
-                writes.add(dest + i)
-            reads.add(src)
+            writes = set(range(dest, dest + VLEN))
+            reads = {src}
         elif op == 'multiply_add':
             # (multiply_add, dest, a, b, c)
             _, dest, a, b, c = slot
+            writes = set()
+            reads = set()
             for i in range(VLEN):
                 writes.add(dest + i)
                 reads.add(a + i)
@@ -70,6 +70,8 @@ def get_rw(engine, slot):
         else:
             # (op, dest, a1, a2)
             _, dest, a1, a2 = slot
+            writes = set()
+            reads = set()
             for i in range(VLEN):
                 writes.add(dest + i)
                 reads.add(a1 + i)
@@ -80,41 +82,38 @@ def get_rw(engine, slot):
         if op == 'load':
             # (load, dest, addr)
             _, dest, addr = slot
-            writes.add(dest)
-            reads.add(addr)
+            writes = {dest}
+            reads = {addr}
             mem_read = True
         elif op == 'load_offset':
             # (load_offset, dest, addr, offset)
             _, dest, addr, offset = slot
-            writes.add(dest + offset)
-            reads.add(addr + offset)
+            writes = {dest + offset}
+            reads = {addr + offset}
             mem_read = True
         elif op == 'vload':
             # (vload, dest, addr)
             _, dest, addr = slot
-            for i in range(VLEN):
-                writes.add(dest + i)
-            reads.add(addr)
+            writes = set(range(dest, dest + VLEN))
+            reads = {addr}
             mem_read = True
         elif op == 'const':
             # (const, dest, val)
             _, dest, val = slot
-            writes.add(dest)
+            writes = {dest}
 
     elif engine == 'store':
         op = slot[0]
         if op == 'store':
             # (store, addr, src)
             _, addr, src = slot
-            reads.add(addr)
-            reads.add(src)
+            reads = {addr, src}
             mem_write = True
         elif op == 'vstore':
             # (vstore, addr, src)
             _, addr, src = slot
+            reads = set(range(src, src + VLEN))
             reads.add(addr)
-            for i in range(VLEN):
-                reads.add(src + i)
             mem_write = True
 
     elif engine == 'flow':
@@ -122,18 +121,18 @@ def get_rw(engine, slot):
         if op == 'select':
             # (select, dest, cond, a, b)
             _, dest, cond, a, b = slot
-            writes.add(dest)
-            reads.add(cond)
-            reads.add(a)
-            reads.add(b)
+            writes = {dest}
+            reads = {cond, a, b}
         elif op == 'add_imm':
             # (add_imm, dest, a, imm)
             _, dest, a, imm = slot
-            writes.add(dest)
-            reads.add(a)
+            writes = {dest}
+            reads = {a}
         elif op == 'vselect':
             # (vselect, dest, cond, a, b)
             _, dest, cond, a, b = slot
+            writes = set()
+            reads = set()
             for i in range(VLEN):
                 writes.add(dest + i)
                 reads.add(cond + i)
@@ -142,23 +141,23 @@ def get_rw(engine, slot):
         elif op == 'cond_jump':
             # (cond_jump, cond, addr)
             _, cond, addr = slot
-            reads.add(cond)
+            reads = {cond}
         elif op == 'cond_jump_rel':
             # (cond_jump_rel, cond, offset)
             _, cond, offset = slot
-            reads.add(cond)
+            reads = {cond}
         elif op == 'jump_indirect':
             # (jump_indirect, addr)
             _, addr = slot
-            reads.add(addr)
+            reads = {addr}
         elif op == 'trace_write':
             # (trace_write, val)
             _, val = slot
-            reads.add(val)
+            reads = {val}
         elif op == 'coreid':
             # (coreid, dest)
             _, dest = slot
-            writes.add(dest)
+            writes = {dest}
         # jump, halt, pause: no regs
 
     elif engine == 'debug':
@@ -166,12 +165,14 @@ def get_rw(engine, slot):
         if op == 'compare':
             # (compare, val, key)
             _, val, key = slot
-            reads.add(val)
+            reads = {val}
         elif op == 'vcompare':
             # (vcompare, val, keys)
             _, val, keys = slot
-            for i in range(VLEN):
-                reads.add(val + i)
+            reads = set(range(val, val + VLEN))
+
+    if reads is None: reads = set()
+    if writes is None: writes = set()
 
     return reads, writes, mem_read, mem_write
 
