@@ -457,8 +457,9 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            t = self.alloc_scratch()
+            self.add("load", ("const", t, i))
+            self.add("load", ("load", self.scratch[v], t))
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
@@ -518,12 +519,16 @@ class KernelBuilder:
         for vi in range(vector_loops):
             i = vi * VLEN
             i_const = self.scratch_const(i)
+            # Use unique address register to allow parallelism
+            addr_reg = tmp1s[vi % UNROLL_FACTOR]
             # vload idx
-            prologue.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-            prologue.append(("load", ("vload", idx_buf + i, tmp_addr)))
+            prologue.append(("alu", ("+", addr_reg, self.scratch["inp_indices_p"], i_const)))
+            prologue.append(("load", ("vload", idx_buf + i, addr_reg)))
             # vload val
-            prologue.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-            prologue.append(("load", ("vload", val_buf + i, tmp_addr)))
+            # Note: Reusing addr_reg creates a dependency between idx load and val load for this vector,
+            # but that's fine as long as different vectors are parallel.
+            prologue.append(("alu", ("+", addr_reg, self.scratch["inp_values_p"], i_const)))
+            prologue.append(("load", ("vload", val_buf + i, addr_reg)))
 
         for i in range(remainder_start, batch_size):
             i_const = self.scratch_const(i)
@@ -574,33 +579,31 @@ class KernelBuilder:
                     tmp3_u = tmp3s[u]
 
                     if use_mux:
-                        # Mux Logic
-                        # Calculate offset = idx - base_idx
-                        base_idx_vec = self.scratch_const_vec((1 << round) - 1)
-                        # We use tmp1_u to hold offset
-                        ops_loads.append(("valu", ("-", tmp1_u, curr_idx_vec, base_idx_vec)))
-
                         current_vals = list(mux_vals)
-                        current_bit = 0
 
-                        # Layered selection
-                        # Results need to go into temps.
                         # Round 0: 1 val. Direct copy to tmp_node_val_u.
                         if len(current_vals) == 1:
-                            ops_loads.append(("valu", ("+", tmp_node_val_u, current_vals[0], zero_vec))) # Move
+                            # Optimize: Alias tmp_node_val_u to the constant register to avoid Move
+                            tmp_node_val_u = current_vals[0]
 
                         # Round 1: 2 vals. 1 select.
-                        # bit0 -> tmp2_u.
-                        # vselect(tmp2_u, val1, val0) -> tmp_node_val_u
+                        # Optimize: Use (idx & 1) instead of (idx - base).
+                        # Node 1 (idx odd) -> 1. Node 2 (idx even) -> 0.
+                        # vselect(cond, A, B). 1->A, 0->B.
+                        # We want Node 1 (vals[0]) if 1. Node 2 (vals[1]) if 0.
                         elif len(current_vals) == 2:
                             mask_vec = self.scratch_const_vec(1)
-                            ops_loads.append(("valu", ("&", tmp2_u, tmp1_u, mask_vec)))
-                            ops_loads.append(("flow", ("vselect", tmp_node_val_u, tmp2_u, current_vals[1], current_vals[0])))
+                            ops_loads.append(("valu", ("&", tmp2_u, curr_idx_vec, mask_vec)))
+                            ops_loads.append(("flow", ("vselect", tmp_node_val_u, tmp2_u, current_vals[0], current_vals[1])))
 
                         # Round 2: 4 vals.
                         # Layer 1 (bit 0): (0,1)->tmp3_u, (2,3)->tmp_node_val_u
                         # Layer 2 (bit 1): (tmp3_u, tmp_node_val_u)->tmp_node_val_u
                         elif len(current_vals) == 4:
+                            # Restore offset calculation for generic case
+                            base_idx_vec = self.scratch_const_vec((1 << round) - 1)
+                            ops_loads.append(("valu", ("-", tmp1_u, curr_idx_vec, base_idx_vec)))
+
                             # Bit 0
                             mask_vec = self.scratch_const_vec(1)
                             ops_loads.append(("valu", ("&", tmp2_u, tmp1_u, mask_vec)))
@@ -635,11 +638,13 @@ class KernelBuilder:
 
                     # Vectorized index update
                     # inc = 1 + (val & 1)
+                    # idx = 2 * idx + inc
+                    # idx = 2 * idx + 1 + (val & 1)
+                    # Use multiply_add: d = a * b + c
+                    # We want: idx = idx * 2 + (1 + (val & 1))
                     ops_updates.append(("valu", ("&", tmp1_u, curr_val_vec, one_vec)))
                     ops_updates.append(("valu", ("+", tmp3_u, one_vec, tmp1_u)))
-
-                    ops_updates.append(("valu", ("*", curr_idx_vec, curr_idx_vec, two_vec)))
-                    ops_updates.append(("valu", ("+", curr_idx_vec, curr_idx_vec, tmp3_u)))
+                    ops_updates.append(("valu", ("multiply_add", curr_idx_vec, curr_idx_vec, two_vec, tmp3_u)))
 
                     # Wrap: idx = idx * (idx < n_nodes)
                     # Optimization: Only needed if max_idx could exceed n_nodes
@@ -685,10 +690,11 @@ class KernelBuilder:
         for vi in range(vector_loops):
             i = vi * VLEN
             i_const = self.scratch_const(i)
-            epilogue.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-            epilogue.append(("store", ("vstore", tmp_addr, idx_buf + i)))
-            epilogue.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-            epilogue.append(("store", ("vstore", tmp_addr, val_buf + i)))
+            addr_reg = tmp1s[vi % UNROLL_FACTOR]
+            epilogue.append(("alu", ("+", addr_reg, self.scratch["inp_indices_p"], i_const)))
+            epilogue.append(("store", ("vstore", addr_reg, idx_buf + i)))
+            epilogue.append(("alu", ("+", addr_reg, self.scratch["inp_values_p"], i_const)))
+            epilogue.append(("store", ("vstore", addr_reg, val_buf + i)))
 
         for i in range(remainder_start, batch_size):
             i_const = self.scratch_const(i)
