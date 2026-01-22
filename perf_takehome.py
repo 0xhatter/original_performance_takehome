@@ -19,6 +19,7 @@ We recommend you look through problem.py next.
 from collections import defaultdict
 import random
 import unittest
+import heapq
 
 from problem import (
     Engine,
@@ -36,12 +37,12 @@ from problem import (
     reference_kernel2,
 )
 
-
 def get_rw(engine, slot):
     reads = set()
     writes = set()
     mem_read = False
     mem_write = False
+    op = slot[0]
 
     if engine == 'alu':
         # (op, dest, a1, a2)
@@ -174,6 +175,178 @@ def get_rw(engine, slot):
 
     return reads, writes, mem_read, mem_write
 
+class Scheduler:
+    def schedule(self, slots):
+        # 1. Build nodes
+        nodes = []
+        for i, (engine, slot) in enumerate(slots):
+            reads, writes, mem_read, mem_write = get_rw(engine, slot)
+            nodes.append({
+                'id': i, 'engine': engine, 'slot': slot,
+                'reads': reads, 'writes': writes,
+                'mem_read': mem_read, 'mem_write': mem_write,
+                'preds': [], 'succs': [],
+                'unscheduled_preds': 0,
+                'priority': 0
+            })
+
+        # 2. Add dependencies
+        last_writer = {} # reg -> node_id
+        last_readers = defaultdict(list) # reg -> list of node_ids
+
+        # Memory serialization
+        last_mem_write = None
+        last_mem_read = [] # list of node_ids
+
+        for n in nodes:
+            nid = n['id']
+            deps = set()
+
+            # RAW: Dependency on last writer of any read register
+            for r in n['reads']:
+                if r in last_writer:
+                    deps.add(last_writer[r])
+
+            # WAR: Dependency on all previous readers of registers I am writing
+            for w in n['writes']:
+                if w in last_readers:
+                    for reader_id in last_readers[w]:
+                        deps.add(reader_id)
+
+            # WAW: Dependency on last writer of any written register
+            for w in n['writes']:
+                if w in last_writer:
+                    deps.add(last_writer[w])
+
+            # Memory Deps
+            # If Store: Dep on all previous Load/Store
+            if n['mem_write']:
+                if last_mem_write is not None:
+                    deps.add(last_mem_write)
+                for rid in last_mem_read:
+                    deps.add(rid)
+            # If Load: Dep on last Store
+            if n['mem_read']:
+                if last_mem_write is not None:
+                    deps.add(last_mem_write)
+
+            # Add edges
+            for dep_id in deps:
+                nodes[dep_id]['succs'].append(nid)
+                n['preds'].append(dep_id)
+
+            # Update state
+
+            # Update last_readers for registers read by this node
+            for r in n['reads']:
+                last_readers[r].append(nid)
+
+            # Update last_writer and clear last_readers for registers written by this node
+            for w in n['writes']:
+                last_writer[w] = nid
+                last_readers[w] = []
+
+            if n['mem_write']:
+                last_mem_write = nid
+                last_mem_read = []
+            if n['mem_read']:
+                last_mem_read.append(nid)
+
+        # 3. Calculate priorities (Critical Path)
+        memo = {}
+        def get_height(nid):
+            if nid in memo: return memo[nid]
+            h = 0
+            for succ_id in nodes[nid]['succs']:
+                h = max(h, get_height(succ_id))
+            memo[nid] = 1 + h
+            return 1 + h
+
+        # Recursive height calc might hit recursion limit if chain is 50k deep.
+        # Use iterative approach for DAG height.
+        # 1. Compute in-degrees for topo sort
+        in_degree = defaultdict(int)
+        for n in nodes:
+            for s in n['succs']:
+                in_degree[s] += 1
+
+        # 2. Topo sort (Kahn's)
+        q = [n['id'] for n in nodes if in_degree[n['id']] == 0]
+        topo_order = []
+        while q:
+            u = q.pop(0)
+            topo_order.append(u)
+            for v in nodes[u]['succs']:
+                in_degree[v] -= 1
+                if in_degree[v] == 0:
+                    q.append(v)
+
+        # 3. Compute height in reverse topo order
+        heights = {}
+        for u in reversed(topo_order):
+            h = 0
+            for v in nodes[u]['succs']:
+                h = max(h, heights.get(v, 0))
+            heights[u] = 1 + h
+
+        for n in nodes:
+            n['priority'] = heights[n['id']]
+            # Prioritize LOADs because they are the bottleneck
+            if n['engine'] == 'load':
+                n['priority'] += 10000
+            elif n['engine'] == 'flow':
+                n['priority'] += 5000
+            n['unscheduled_preds'] = len(n['preds'])
+
+        # 4. List Scheduling
+        # Use heap for ready queue. Min heap, so store -priority.
+        # Tie-breaker: smaller ID (original order) to keep stability?
+        # Using n['id'] as tie breaker.
+        ready_queue = []
+        for n in nodes:
+            if n['unscheduled_preds'] == 0:
+                heapq.heappush(ready_queue, (-n['priority'], n['id']))
+
+        instrs = []
+
+        while ready_queue:
+            cycle_instr = defaultdict(list)
+            temp_queue = []
+            selected_nodes = []
+
+            # Pop nodes that fit in this cycle
+            while ready_queue:
+                prio, nid = heapq.heappop(ready_queue)
+                node = nodes[nid]
+                eng = node['engine']
+
+                # Check limits
+                limit = SLOT_LIMITS.get(eng, 0)
+                if len(cycle_instr[eng]) < limit:
+                    cycle_instr[eng].append(node['slot'])
+                    selected_nodes.append(node)
+                else:
+                    temp_queue.append((prio, nid))
+
+            # Put back deferred nodes
+            for item in temp_queue:
+                heapq.heappush(ready_queue, item)
+
+            if not selected_nodes:
+                # Should not happen unless limits are 0 or empty queue (but loop condition handles that)
+                break
+
+            instrs.append(dict(cycle_instr))
+
+            # Unlock successors
+            for node in selected_nodes:
+                for succ_id in node['succs']:
+                    succ = nodes[succ_id]
+                    succ['unscheduled_preds'] -= 1
+                    if succ['unscheduled_preds'] == 0:
+                        heapq.heappush(ready_queue, (-succ['priority'], succ['id']))
+
+        return instrs
 
 class KernelBuilder:
     def __init__(self):
@@ -188,127 +361,17 @@ class KernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        return self.pack_slots(slots)
+        # Use the smart scheduler
+        return Scheduler().schedule(slots)
 
     def _get_rw(self, engine, slot):
-        reads = set()
-        writes = set()
-        op = slot[0]
-
-        if engine == "alu":
-            # (op, dest, a1, a2)
-            _, dest, a1, a2 = slot
-            reads.add(a1); reads.add(a2)
-            writes.add(dest)
-        elif engine == "valu":
-            if op == "vbroadcast":
-                _, dest, src = slot
-                reads.add(src)
-                for k in range(VLEN): writes.add(dest + k)
-            elif op == "multiply_add":
-                _, dest, a, b, c = slot
-                for k in range(VLEN):
-                    reads.add(a + k); reads.add(b + k); reads.add(c + k)
-                    writes.add(dest + k)
-            else:
-                _, dest, a1, a2 = slot
-                for k in range(VLEN):
-                    reads.add(a1 + k); reads.add(a2 + k)
-                    writes.add(dest + k)
-        elif engine == "load":
-            if op == "load":
-                _, dest, addr = slot
-                reads.add(addr)
-                writes.add(dest)
-            elif op == "vload":
-                _, dest, addr = slot
-                reads.add(addr)
-                for k in range(VLEN): writes.add(dest + k)
-            elif op == "const":
-                _, dest, val = slot
-                writes.add(dest)
-            elif op == "load_offset":
-                _, dest, addr, off = slot
-                reads.add(addr + off)
-                writes.add(dest + off)
-        elif engine == "store":
-            if op == "store":
-                _, addr, src = slot
-                reads.add(addr); reads.add(src)
-            elif op == "vstore":
-                _, addr, src = slot
-                reads.add(addr)
-                for k in range(VLEN): reads.add(src + k)
-        elif engine == "flow":
-            if op == "select":
-                _, dest, cond, a, b = slot
-                reads.add(cond); reads.add(a); reads.add(b)
-                writes.add(dest)
-            elif op == "vselect":
-                _, dest, cond, a, b = slot
-                for k in range(VLEN):
-                    reads.add(cond + k); reads.add(a + k); reads.add(b + k)
-                    writes.add(dest + k)
-            elif op == "add_imm":
-                _, dest, a, imm = slot
-                reads.add(a)
-                writes.add(dest)
-            elif op == "cond_jump":
-                _, cond, addr = slot
-                reads.add(cond)
-            elif op == "cond_jump_rel":
-                _, cond, offset = slot
-                reads.add(cond)
-            elif op == "jump_indirect":
-                _, addr = slot
-                reads.add(addr)
-            elif op == "trace_write":
-                _, val = slot
-                reads.add(val)
-            elif op == "coreid":
-                _, dest = slot
-                writes.add(dest)
-            # jump, halt, pause: no scratch rw
-        elif engine == "debug":
-            if op == "compare":
-                _, loc, key = slot
-                reads.add(loc)
-            elif op == "vcompare":
-                _, loc, keys = slot
-                for k in range(VLEN): reads.add(loc + k)
-
+        # Legacy method kept for compatibility if needed, but we use standalone get_rw
+        reads, writes, _, _ = get_rw(engine, slot)
         return reads, writes
 
     def pack_slots(self, slots):
-        instrs = []
-        current_instr = defaultdict(list)
-        written_in_bundle = set()
-
-        for engine, slot in slots:
-            reads, writes = self._get_rw(engine, slot)
-
-            # Check dependency
-            has_dependency = not reads.isdisjoint(written_in_bundle)
-
-            # Check limits
-            limit = SLOT_LIMITS.get(engine, 0)
-            current_count = len(current_instr[engine])
-            limit_reached = current_count >= limit
-
-            if has_dependency or limit_reached:
-                # Flush current instruction
-                if current_instr:
-                    instrs.append(dict(current_instr))
-                current_instr = defaultdict(list)
-                written_in_bundle = set()
-
-            current_instr[engine].append(slot)
-            written_in_bundle.update(writes)
-
-        if current_instr:
-            instrs.append(dict(current_instr))
-
-        return instrs
+        # Use the smart scheduler here too
+        return Scheduler().schedule(slots)
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -354,11 +417,19 @@ class KernelBuilder:
     def build_hash_vector(self, val_hash_vec, tmp1_vec, tmp2_vec, round, i):
         slots = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            c1 = self.scratch_const_vec(val1)
-            c3 = self.scratch_const_vec(val3)
-            slots.append(("valu", (op1, tmp1_vec, val_hash_vec, c1)))
-            slots.append(("valu", (op3, tmp2_vec, val_hash_vec, c3)))
-            slots.append(("valu", (op2, val_hash_vec, tmp1_vec, tmp2_vec)))
+            # Optimize (x + c) + ((x + c) << s) -> x * (1 + 2^s) + c * (1 + 2^s)
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                multiplier = (1 << val3) + 1
+                adder = val1
+                c_mul = self.scratch_const_vec(multiplier)
+                c_add = self.scratch_const_vec(adder)
+                slots.append(("valu", ("multiply_add", val_hash_vec, val_hash_vec, c_mul, c_add)))
+            else:
+                c1 = self.scratch_const_vec(val1)
+                c3 = self.scratch_const_vec(val3)
+                slots.append(("valu", (op1, tmp1_vec, val_hash_vec, c1)))
+                slots.append(("valu", (op3, tmp2_vec, val_hash_vec, c3)))
+                slots.append(("valu", (op2, val_hash_vec, tmp1_vec, tmp2_vec)))
             # keys = [(round, i + k, "hash_stage", hi) for k in range(VLEN)]
             # slots.append(("debug", ("vcompare", val_hash_vec, keys)))
         return slots
@@ -417,14 +488,21 @@ class KernelBuilder:
         inp_values_addr = self.alloc_scratch("inp_values_addr")
 
         # Temp vectors for unrolling
-        UNROLL_FACTOR = 4
+        UNROLL_FACTOR = 32
         tmp_node_vals = [self.alloc_scratch_vec(f"tmp_node_val_{k}") for k in range(UNROLL_FACTOR)]
         tmp1s = [self.alloc_scratch_vec(f"tmp1_{k}") for k in range(UNROLL_FACTOR)]
-        tmp2s = [self.alloc_scratch_vec(f"tmp2_{k}") for k in range(UNROLL_FACTOR)]
-        tmp3s = [self.alloc_scratch_vec(f"tmp3_{k}") for k in range(UNROLL_FACTOR)]
+        # Reuse tmp_node_vals for tmp2 to save scratch space
+        tmp2s = tmp_node_vals
+        # Reuse tmp1 for tmp3 to save scratch space
+        tmp3s = tmp1s
 
         # Address registers for unrolled gather (scalar)
-        tmp_addrs_pool = [self.alloc_scratch(f"tmp_addr_{k}") for k in range(UNROLL_FACTOR * VLEN)]
+        # Reuse tmp1s as address registers to save space
+        tmp_addrs_pool = []
+        for u in range(UNROLL_FACTOR):
+             base = tmp1s[u]
+             for k in range(VLEN):
+                 tmp_addrs_pool.append(base + k)
 
         # Buffers in scratch to avoid memory traffic
         idx_buf = self.alloc_scratch("idx_buf", length=batch_size)
@@ -456,6 +534,22 @@ class KernelBuilder:
         self.instrs.extend(self.pack_slots(prologue))
 
         for round in range(rounds):
+            # Pre-load tree values for Mux (Round 0-2)
+            mux_vals = []
+            use_mux = round <= 1
+            if use_mux:
+                base_idx = (1 << round) - 1
+                count = 1 << round
+                for k in range(count):
+                    k_const = self.scratch_const(base_idx + k)
+                    addr_reg = self.alloc_scratch()
+                    body.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], k_const)))
+                    val_scalar = self.alloc_scratch()
+                    body.append(("load", ("load", val_scalar, addr_reg)))
+                    val_vec = self.alloc_scratch_vec()
+                    body.append(("valu", ("vbroadcast", val_vec, val_scalar)))
+                    mux_vals.append(val_vec)
+
             for vui in range(unrolled_loops):
                 vi_base = vui * UNROLL_FACTOR
 
@@ -478,27 +572,80 @@ class KernelBuilder:
                     tmp2_u = tmp2s[u]
                     tmp3_u = tmp3s[u]
 
-                    # node_val_vec gather
-                    for k in range(VLEN):
-                        # Use unique addr reg
-                        addr_reg = tmp_addrs_pool[u * VLEN + k]
-                        ops_addrs.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], curr_idx_vec + k)))
-                        ops_loads.append(("load", ("load", tmp_node_val_u + k, addr_reg)))
+                    if use_mux:
+                        # Mux Logic
+                        # Calculate offset = idx - base_idx
+                        base_idx_vec = self.scratch_const_vec((1 << round) - 1)
+                        # We use tmp1_u to hold offset
+                        ops_loads.append(("valu", ("-", tmp1_u, curr_idx_vec, base_idx_vec)))
+
+                        current_vals = list(mux_vals)
+                        current_bit = 0
+
+                        # Layered selection
+                        # Results need to go into temps.
+                        # Round 0: 1 val. Direct copy to tmp_node_val_u.
+                        if len(current_vals) == 1:
+                            ops_loads.append(("valu", ("+", tmp_node_val_u, current_vals[0], zero_vec))) # Move
+
+                        # Round 1: 2 vals. 1 select.
+                        # bit0 -> tmp2_u.
+                        # vselect(tmp2_u, val1, val0) -> tmp_node_val_u
+                        elif len(current_vals) == 2:
+                            mask_vec = self.scratch_const_vec(1)
+                            ops_loads.append(("valu", ("&", tmp2_u, tmp1_u, mask_vec)))
+                            ops_loads.append(("flow", ("vselect", tmp_node_val_u, tmp2_u, current_vals[1], current_vals[0])))
+
+                        # Round 2: 4 vals.
+                        # Layer 1 (bit 0): (0,1)->tmp3_u, (2,3)->tmp_node_val_u
+                        # Layer 2 (bit 1): (tmp3_u, tmp_node_val_u)->tmp_node_val_u
+                        elif len(current_vals) == 4:
+                            # Bit 0
+                            mask_vec = self.scratch_const_vec(1)
+                            ops_loads.append(("valu", ("&", tmp2_u, tmp1_u, mask_vec)))
+
+                            # Select low pair -> tmp3_u
+                            ops_loads.append(("flow", ("vselect", tmp3_u, tmp2_u, current_vals[1], current_vals[0])))
+
+                            # Select high pair -> tmp_node_val_u
+                            ops_loads.append(("flow", ("vselect", tmp_node_val_u, tmp2_u, current_vals[3], current_vals[2])))
+
+                            # Bit 1
+                            mask_vec = self.scratch_const_vec(2)
+                            ops_loads.append(("valu", ("&", tmp2_u, tmp1_u, mask_vec)))
+
+                            # Final select
+                            # Note: flow limit 1. This pipeline will stall if 2 vselects in parallel.
+                            # But we have 32 vectors. Scheduler will interleave.
+                            # Also consider using VALU select if needed. But let's try flow first.
+                            ops_loads.append(("flow", ("vselect", tmp_node_val_u, tmp2_u, tmp_node_val_u, tmp3_u)))
+
+                    else:
+                        # node_val_vec gather
+                        for k in range(VLEN):
+                            # Use unique addr reg
+                            addr_reg = tmp_addrs_pool[u * VLEN + k]
+                            ops_addrs.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], curr_idx_vec + k)))
+                            ops_loads.append(("load", ("load", tmp_node_val_u + k, addr_reg)))
 
                     # Vectorized hash
                     ops_hashes.append(("valu", ("^", curr_val_vec, curr_val_vec, tmp_node_val_u)))
                     ops_hashes.extend(self.build_hash_vector(curr_val_vec, tmp1_u, tmp2_u, round, i))
 
                     # Vectorized index update
+                    # inc = 1 + (val & 1)
                     ops_updates.append(("valu", ("&", tmp1_u, curr_val_vec, one_vec)))
-                    ops_updates.append(("valu", ("==", tmp1_u, tmp1_u, zero_vec)))
-                    ops_updates.append(("flow", ("vselect", tmp3_u, tmp1_u, one_vec, two_vec)))
+                    ops_updates.append(("valu", ("+", tmp3_u, one_vec, tmp1_u)))
 
                     ops_updates.append(("valu", ("*", curr_idx_vec, curr_idx_vec, two_vec)))
                     ops_updates.append(("valu", ("+", curr_idx_vec, curr_idx_vec, tmp3_u)))
 
-                    ops_updates.append(("valu", ("<", tmp1_u, curr_idx_vec, n_nodes_vec)))
-                    ops_updates.append(("flow", ("vselect", curr_idx_vec, tmp1_u, curr_idx_vec, zero_vec)))
+                    # Wrap: idx = idx * (idx < n_nodes)
+                    # Optimization: Only needed if max_idx could exceed n_nodes
+                    # max_idx at end of round r is roughly 2^(r+1).
+                    if (1 << (round + 1)) >= n_nodes:
+                        ops_updates.append(("valu", ("<", tmp1_u, curr_idx_vec, n_nodes_vec)))
+                        ops_updates.append(("valu", ("*", curr_idx_vec, curr_idx_vec, tmp1_u)))
 
                 body.extend(ops_addrs)
                 body.extend(ops_loads)
