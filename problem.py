@@ -354,8 +354,7 @@ class Machine:
 
         for addr in modified_scratch_addrs:
             name, length = self.debug_info.scratch_map[addr]
-            val = str(core.scratch[addr : addr + length])
-            val = val.replace("[", "").replace("]", "")
+            val = ", ".join(map(str, core.scratch[addr : addr + length]))
             self.trace.write(
                 f'{{"name": "{val}", "cat": "op", "ph": "X", "pid": {len(self.cores) + core.id}, "tid": {BASE_ADDR_TID + addr}, "ts": {self.cycle}, "dur": 1 }},\n'
             )
