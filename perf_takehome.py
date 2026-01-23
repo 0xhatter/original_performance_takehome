@@ -448,7 +448,7 @@ class KernelBuilder:
 
         vector_loops = batch_size // VLEN
         unrolled_loops = vector_loops // UNROLL_FACTOR
-        remainder_start = unrolled_loops * UNROLL_FACTOR * VLEN
+        remainder_start = vector_loops * VLEN
 
         prologue = []
         for vi in range(vector_loops):
@@ -584,6 +584,74 @@ class KernelBuilder:
                 self.pending_slots.extend(ops_loads)
                 self.pending_slots.extend(ops_hashes)
                 self.pending_slots.extend(ops_updates)
+
+            # Vector cleanup loop for remaining vectors
+            for vi in range(unrolled_loops * UNROLL_FACTOR, vector_loops):
+                i = vi * VLEN
+                curr_idx_vec = idx_buf + i
+                curr_val_vec = val_buf + i
+                
+                t_node = tmp_node_vals[0]
+                t1 = tmp1s[0]
+                t3 = tmp3s[0]
+
+                if use_mux:
+                    base_idx = (1 << eff_round) - 1
+                    count = 1 << eff_round
+                    current_vals = vec_tree_vals[base_idx : base_idx + count]
+
+                    def emit_sel(dest, mask, a, b):
+                        self.pending_slots.append(("flow", ("vselect", dest, mask, a, b)))
+
+                    def bld_sel(vals, bit_index, avail_regs):
+                        if len(vals) == 1: 
+                            return vals[0]
+                        mid = len(vals) // 2
+                        vals0, vals1 = vals[:mid], vals[mid:]
+                        
+                        dest = avail_regs[0]
+                        inner = avail_regs[1:]
+                        
+                        L = bld_sel(vals0, bit_index - 1, inner)
+                        used_by_L = 1 if len(vals0) > 1 else 0
+                        R = bld_sel(vals1, bit_index - 1, inner[used_by_L:])
+                        
+                        base_val = (1 << eff_round) - 1
+                        base_const = self.scratch_const_vec(base_val)
+
+                        self.pending_slots.append(("valu", ("-", dest, curr_idx_vec, base_const)))
+                        if bit_index > 0:
+                            s_const = self.scratch_const_vec(bit_index)
+                            self.pending_slots.append(("valu", (">>", dest, dest, s_const)))
+                        
+                        m_const = self.scratch_const_vec(1)
+                        self.pending_slots.append(("valu", ("&", dest, dest, m_const)))
+                        
+                        emit_sel(dest, dest, R, L)
+                        return dest
+
+                    import math
+                    top_bit = int(math.log2(len(current_vals))) - 1
+                    regs = [t_node, t1, t3]
+                    res = bld_sel(current_vals, top_bit, regs)
+                    if res != t_node:
+                         self.pending_slots.append(("valu", ("+", t_node, res, zero_vec)))
+                else:
+                    for k in range(VLEN):
+                        addr_reg = tmp_addrs_pool[k]
+                        self.pending_slots.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], curr_idx_vec + k)))
+                        self.pending_slots.append(("load", ("load", t_node + k, addr_reg)))
+
+                self.pending_slots.append(("valu", ("^", curr_val_vec, curr_val_vec, t_node)))
+                self.pending_slots.extend(self.build_hash_vector(curr_val_vec, t1, t3, round, i))
+
+                self.pending_slots.append(("valu", ("&", t1, curr_val_vec, one_vec)))
+                self.pending_slots.append(("valu", ("+", t3, one_vec, t1)))
+                self.pending_slots.append(("valu", ("multiply_add", curr_idx_vec, curr_idx_vec, two_vec, t3)))
+
+                if (1 << (round + 1)) >= n_nodes:
+                    self.pending_slots.append(("valu", ("<", t1, curr_idx_vec, n_nodes_vec)))
+                    self.pending_slots.append(("flow", ("vselect", curr_idx_vec, t1, curr_idx_vec, zero_vec)))
 
             for i in range(remainder_start, batch_size):
                 curr_idx = idx_buf + i
