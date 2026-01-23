@@ -478,6 +478,9 @@ class KernelBuilder:
         # Just add to pending
         self.pending_slots.extend(prologue)
 
+        PIPELINE_STRIDE = 10
+        last_result_vec = [None] * UNROLL_FACTOR
+
         for round in range(rounds):
             eff_round = round % (forest_height + 1)
             # Enable Round 2 Mux with Pipelining!
@@ -497,6 +500,15 @@ class KernelBuilder:
 
                     curr_idx_vec = idx_buf + i
                     curr_val_vec = val_buf + i
+
+                    # INJECT PIPELINE DEPENDENCY
+                    prev_u = u - PIPELINE_STRIDE
+                    if prev_u >= 0 and last_result_vec[prev_u] is not None:
+                         dep_reg = last_result_vec[prev_u]
+                         # Inject a dummy ALU add: tmp = dep + 0
+                         # This uses the IDLE 'alu' engine instead of the busy 'valu' engine.
+                         # It reads the first element of the vector dependency, creating a RAW edge.
+                         ops_loads.append(("alu", ("+", tmp1, dep_reg, zero_const)))
 
                     tmp_node_val_u = tmp_node_vals[u]
                     tmp1_u = tmp1s[u]
@@ -564,6 +576,9 @@ class KernelBuilder:
                     if (1 << (round + 1)) >= n_nodes:
                         ops_updates.append(("valu", ("<", tmp1_u, curr_idx_vec, n_nodes_vec)))
                         ops_updates.append(("flow", ("vselect", curr_idx_vec, tmp1_u, curr_idx_vec, zero_vec)))
+
+                    # Update the result register for the next pipeline stage
+                    last_result_vec[u] = curr_val_vec
 
                 self.pending_slots.extend(ops_addrs)
                 self.pending_slots.extend(ops_loads)
@@ -641,8 +656,19 @@ def do_kernel_test(
         trace=trace,
     )
     machine.prints = prints
-    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
+
+    # Run reference kernel to the end to get final state
+    ref_mem = None
+    for ref_mem in reference_kernel2(mem, value_trace):
+        pass
+
+    # Run machine until finished (handling pauses)
+    from problem import CoreState
+    while machine.cores[0].state != CoreState.STOPPED:
         machine.run()
+
+    try:
+        # Check final result
         inp_values_p = ref_mem[6]
         if prints:
             print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
@@ -650,11 +676,18 @@ def do_kernel_test(
         assert (
             machine.mem[inp_values_p : inp_values_p + len(inp.values)]
             == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
+        ), f"Incorrect result (Final)"
+
         inp_indices_p = ref_mem[5]
         if prints:
             print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
             print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
+        assert (
+            machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)]
+            == ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)]
+        ), f"Incorrect indices (Final)"
+    except AssertionError as e:
+        print(e)
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
