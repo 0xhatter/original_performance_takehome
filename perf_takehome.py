@@ -1,20 +1,3 @@
-"""
-# Anthropic's Original Performance Engineering Take-home (Release version)
-
-Copyright Anthropic PBC 2026. Permission is granted to modify and use, but not
-to publish or redistribute your solutions so it's hard to find spoilers.
-
-# Task
-
-- Optimize the kernel (in KernelBuilder.build_kernel) as much as possible in the
-  available time, as measured by test_kernel_cycles on a frozen separate copy
-  of the simulator.
-
-Validate your results using `python tests/submission_tests.py` without modifying
-anything in the tests/ folder.
-
-We recommend you look through problem.py next.
-"""
 
 from collections import defaultdict
 import random
@@ -253,25 +236,12 @@ class Scheduler:
             if n['mem_read']:
                 last_mem_read.append(nid)
 
-        # 3. Calculate priorities (Critical Path)
-        memo = {}
-        def get_height(nid):
-            if nid in memo: return memo[nid]
-            h = 0
-            for succ_id in nodes[nid]['succs']:
-                h = max(h, get_height(succ_id))
-            memo[nid] = 1 + h
-            return 1 + h
-
-        # Recursive height calc might hit recursion limit if chain is 50k deep.
-        # Use iterative approach for DAG height.
-        # 1. Compute in-degrees for topo sort
+        # 3. Calculate priorities (Critical Path + Successor Count)
+        # Iterative height calc
         in_degree = defaultdict(int)
         for n in nodes:
             for s in n['succs']:
                 in_degree[s] += 1
-
-        # 2. Topo sort (Kahn's)
         q = [n['id'] for n in nodes if in_degree[n['id']] == 0]
         topo_order = []
         while q:
@@ -282,7 +252,6 @@ class Scheduler:
                 if in_degree[v] == 0:
                     q.append(v)
 
-        # 3. Compute height in reverse topo order
         heights = {}
         for u in reversed(topo_order):
             h = 0
@@ -291,18 +260,17 @@ class Scheduler:
             heights[u] = 1 + h
 
         for n in nodes:
-            n['priority'] = heights[n['id']]
+            # Metric: Height * 10 + OutDegree
+            n['priority'] = heights[n['id']] * 10 + len(n['succs'])
+
             # Prioritize LOADs because they are the bottleneck
             if n['engine'] == 'load':
-                n['priority'] += 10000
+                n['priority'] += 100000
             elif n['engine'] == 'flow':
-                n['priority'] += 5000
+                n['priority'] += 50000
             n['unscheduled_preds'] = len(n['preds'])
 
         # 4. List Scheduling
-        # Use heap for ready queue. Min heap, so store -priority.
-        # Tie-breaker: smaller ID (original order) to keep stability?
-        # Using n['id'] as tie breaker.
         ready_queue = []
         for n in nodes:
             if n['unscheduled_preds'] == 0:
@@ -315,13 +283,11 @@ class Scheduler:
             temp_queue = []
             selected_nodes = []
 
-            # Pop nodes that fit in this cycle
             while ready_queue:
                 prio, nid = heapq.heappop(ready_queue)
                 node = nodes[nid]
                 eng = node['engine']
 
-                # Check limits
                 limit = SLOT_LIMITS.get(eng, 0)
                 if len(cycle_instr[eng]) < limit:
                     cycle_instr[eng].append(node['slot'])
@@ -329,17 +295,14 @@ class Scheduler:
                 else:
                     temp_queue.append((prio, nid))
 
-            # Put back deferred nodes
             for item in temp_queue:
                 heapq.heappush(ready_queue, item)
 
             if not selected_nodes:
-                # Should not happen unless limits are 0 or empty queue (but loop condition handles that)
                 break
 
             instrs.append(dict(cycle_instr))
 
-            # Unlock successors
             for node in selected_nodes:
                 for succ_id in node['succs']:
                     succ = nodes[succ_id]
@@ -352,6 +315,7 @@ class Scheduler:
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
+        self.pending_slots = [] # Collect all slots here
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
@@ -362,20 +326,18 @@ class KernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Use the smart scheduler
         return Scheduler().schedule(slots)
 
     def _get_rw(self, engine, slot):
-        # Legacy method kept for compatibility if needed, but we use standalone get_rw
         reads, writes, _, _ = get_rw(engine, slot)
         return reads, writes
 
     def pack_slots(self, slots):
-        # Use the smart scheduler here too
-        return Scheduler().schedule(slots)
+        # Just return the slots, do not schedule yet
+        return slots
 
     def add(self, engine, slot):
-        self.instrs.append({engine: [slot]})
+        self.pending_slots.append((engine, slot))
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -406,19 +368,15 @@ class KernelBuilder:
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
-
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
             slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
             slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            # slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
         return slots
 
     def build_hash_vector(self, val_hash_vec, tmp1_vec, tmp2_vec, round, i):
         slots = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            # Optimize (x + c) + ((x + c) << s) -> x * (1 + 2^s) + c * (1 + 2^s)
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 multiplier = (1 << val3) + 1
                 adder = val1
@@ -431,20 +389,14 @@ class KernelBuilder:
                 slots.append(("valu", (op1, tmp1_vec, val_hash_vec, c1)))
                 slots.append(("valu", (op3, tmp2_vec, val_hash_vec, c3)))
                 slots.append(("valu", (op2, val_hash_vec, tmp1_vec, tmp2_vec)))
-            # keys = [(round, i + k, "hash_stage", hi) for k in range(VLEN)]
-            # slots.append(("debug", ("vcompare", val_hash_vec, keys)))
         return slots
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        """
-        Vectorized kernel implementation with unrolling and scratch buffer optimization.
-        """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
         init_vars = [
             "rounds",
             "n_nodes",
@@ -465,23 +417,14 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
-        # Vector constants
         zero_vec = self.scratch_const_vec(0)
         one_vec = self.scratch_const_vec(1)
         two_vec = self.scratch_const_vec(2)
         n_nodes_vec = self.scratch_const_vec(n_nodes)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
-
-        # Scalar scratch registers
         tmp_idx = self.alloc_scratch("tmp_idx")
         tmp_val = self.alloc_scratch("tmp_val")
         tmp_node_val = self.alloc_scratch("tmp_node_val")
@@ -489,21 +432,17 @@ class KernelBuilder:
         inp_indices_addr = self.alloc_scratch("inp_indices_addr")
         inp_values_addr = self.alloc_scratch("inp_values_addr")
 
-        # Temp vectors for unrolling
         UNROLL_FACTOR = 32
         tmp_node_vals = [self.alloc_scratch_vec(f"tmp_node_val_{k}") for k in range(UNROLL_FACTOR)]
         tmp1s = [self.alloc_scratch_vec(f"tmp1_{k}") for k in range(UNROLL_FACTOR)]
         tmp3s = [self.alloc_scratch_vec(f"tmp3_{k}") for k in range(UNROLL_FACTOR)]
 
-        # Address registers for unrolled gather (scalar)
-        # Reuse tmp1s as address registers to save space
         tmp_addrs_pool = []
         for u in range(UNROLL_FACTOR):
              base = tmp1s[u]
              for k in range(VLEN):
                  tmp_addrs_pool.append(base + k)
 
-        # Buffers in scratch to avoid memory traffic
         idx_buf = self.alloc_scratch("idx_buf", length=batch_size)
         val_buf = self.alloc_scratch("val_buf", length=batch_size)
 
@@ -511,21 +450,23 @@ class KernelBuilder:
         unrolled_loops = vector_loops // UNROLL_FACTOR
         remainder_start = unrolled_loops * UNROLL_FACTOR * VLEN
 
-        # Prologue: Load all data from memory to scratch buffers
         prologue = []
         for vi in range(vector_loops):
             i = vi * VLEN
             i_const = self.scratch_const(i)
-            # Use unique address register to allow parallelism
             addr_reg = tmp1s[vi % UNROLL_FACTOR]
-            # vload idx
             prologue.append(("alu", ("+", addr_reg, self.scratch["inp_indices_p"], i_const)))
             prologue.append(("load", ("vload", idx_buf + i, addr_reg)))
-            # vload val
-            # Note: Reusing addr_reg creates a dependency between idx load and val load for this vector,
-            # but that's fine as long as different vectors are parallel.
             prologue.append(("alu", ("+", addr_reg, self.scratch["inp_values_p"], i_const)))
             prologue.append(("load", ("vload", val_buf + i, addr_reg)))
+
+        MAX_MUX_VALS = 7
+        vec_tree_vals = [self.alloc_scratch_vec(f"tree_val_{k}") for k in range(MAX_MUX_VALS)]
+        for k in range(MAX_MUX_VALS):
+            k_const = self.scratch_const(k)
+            prologue.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], k_const)))
+            prologue.append(("load", ("load", tmp_val, tmp_addr)))
+            prologue.append(("valu", ("vbroadcast", vec_tree_vals[k], tmp_val)))
 
         for i in range(remainder_start, batch_size):
             i_const = self.scratch_const(i)
@@ -534,28 +475,13 @@ class KernelBuilder:
             prologue.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
             prologue.append(("load", ("load", val_buf + i, tmp_addr)))
 
-        self.instrs.extend(self.pack_slots(prologue))
+        # Just add to pending
+        self.pending_slots.extend(prologue)
 
-        # Increase pool size to support up to Round 3 (8 values)
-        mux_pool = [self.alloc_scratch_vec(f"mux_{k}") for k in range(2)]
         for round in range(rounds):
             eff_round = round % (forest_height + 1)
-            # Use Mux for Rounds 0, 1 (and 11, 12)
-            use_mux = eff_round <= 1
-
-            # Pre-load tree values for Mux
-            mux_vals = []
-            if use_mux:
-                base_idx = (1 << eff_round) - 1
-                count = 1 << eff_round
-                for k in range(count):
-                    k_const = self.scratch_const(base_idx + k)
-                    # Reuse tmp_addr and tmp_val for loading
-                    body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], k_const)))
-                    body.append(("load", ("load", tmp_val, tmp_addr)))
-                    val_vec = mux_pool[k]
-                    body.append(("valu", ("vbroadcast", val_vec, tmp_val)))
-                    mux_vals.append(val_vec)
+            # Enable Round 2 Mux with Pipelining!
+            use_mux = eff_round <= 2
 
             for vui in range(unrolled_loops):
                 vi_base = vui * UNROLL_FACTOR
@@ -569,31 +495,28 @@ class KernelBuilder:
                     vi = vi_base + u
                     i = vi * VLEN
 
-                    # Pointers to current vector in scratch buffer
                     curr_idx_vec = idx_buf + i
                     curr_val_vec = val_buf + i
 
-                    # Temps for this unrolled iteration
                     tmp_node_val_u = tmp_node_vals[u]
                     tmp1_u = tmp1s[u]
                     tmp3_u = tmp3s[u]
 
                     if use_mux:
-                        current_vals = list(mux_vals)
+                        base_idx = (1 << eff_round) - 1
+                        count = 1 << eff_round
+                        current_vals = vec_tree_vals[base_idx : base_idx + count]
 
                         def emit_flow_select(dest, mask, a, b):
-                            # dest = a if mask!=0 else b
-                            # Using vselect: dest, cond, a, b
                             ops_loads.append(("flow", ("vselect", dest, mask, a, b)))
 
-                        # Recursive helper to build selection tree
                         def build_select(vals, bit_index, avail_regs):
                             if len(vals) == 1:
                                 return vals[0]
 
                             mid = len(vals) // 2
-                            vals0 = vals[:mid] # Corresponds to mask=0
-                            vals1 = vals[mid:] # Corresponds to mask=1
+                            vals0 = vals[:mid]
+                            vals1 = vals[mid:]
 
                             dest = avail_regs[0]
                             inner_regs = avail_regs[1:]
@@ -606,8 +529,6 @@ class KernelBuilder:
                             base_val = (1 << eff_round) - 1
                             base_const = self.scratch_const_vec(base_val)
 
-                            # mask = (idx - base) >> bit_index & 1
-                            # Reuse dest for mask
                             ops_loads.append(("valu", ("-", dest, curr_idx_vec, base_const)))
                             if bit_index > 0:
                                 shift_const = self.scratch_const_vec(bit_index)
@@ -619,9 +540,7 @@ class KernelBuilder:
                             emit_flow_select(dest, dest, R, L)
                             return dest
 
-                        # Available temps: tmp_node_val_u, tmp1_u, tmp3_u
                         regs = [tmp_node_val_u, tmp1_u, tmp3_u]
-
                         import math
                         top_bit = int(math.log2(len(current_vals))) - 1
 
@@ -630,67 +549,46 @@ class KernelBuilder:
                              ops_loads.append(("valu", ("+", tmp_node_val_u, res, zero_vec)))
 
                     else:
-                        # node_val_vec gather
                         for k in range(VLEN):
-                            # Use unique addr reg
                             addr_reg = tmp_addrs_pool[u * VLEN + k]
                             ops_addrs.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], curr_idx_vec + k)))
                             ops_loads.append(("load", ("load", tmp_node_val_u + k, addr_reg)))
 
-                    # Vectorized hash
                     ops_hashes.append(("valu", ("^", curr_val_vec, curr_val_vec, tmp_node_val_u)))
                     ops_hashes.extend(self.build_hash_vector(curr_val_vec, tmp1_u, tmp3_u, round, i))
 
-                    # Vectorized index update
-                    # inc = 1 + (val & 1)
-                    # idx = 2 * idx + inc
-                    # idx = 2 * idx + 1 + (val & 1)
-                    # Use multiply_add: d = a * b + c
-                    # We want: idx = idx * 2 + (1 + (val & 1))
                     ops_updates.append(("valu", ("&", tmp1_u, curr_val_vec, one_vec)))
                     ops_updates.append(("valu", ("+", tmp3_u, one_vec, tmp1_u)))
                     ops_updates.append(("valu", ("multiply_add", curr_idx_vec, curr_idx_vec, two_vec, tmp3_u)))
 
-                    # Wrap: idx = idx * (idx < n_nodes)
-                    # Optimization: Only needed if max_idx could exceed n_nodes
-                    # max_idx at end of round r is roughly 2^(r+1).
                     if (1 << (round + 1)) >= n_nodes:
                         ops_updates.append(("valu", ("<", tmp1_u, curr_idx_vec, n_nodes_vec)))
                         ops_updates.append(("flow", ("vselect", curr_idx_vec, tmp1_u, curr_idx_vec, zero_vec)))
 
-                body.extend(ops_addrs)
-                body.extend(ops_loads)
-                body.extend(ops_hashes)
-                body.extend(ops_updates)
+                self.pending_slots.extend(ops_addrs)
+                self.pending_slots.extend(ops_loads)
+                self.pending_slots.extend(ops_hashes)
+                self.pending_slots.extend(ops_updates)
 
-            # Scalar remainder loop
             for i in range(remainder_start, batch_size):
                 curr_idx = idx_buf + i
                 curr_val = val_buf + i
 
-                # body.append(("debug", ("compare", curr_idx, (round, i, "idx"))))
-                # body.append(("debug", ("compare", curr_val, (round, i, "val"))))
+                self.pending_slots.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], curr_idx)))
+                self.pending_slots.append(("load", ("load", tmp_node_val, tmp_addr)))
 
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], curr_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                # body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+                self.pending_slots.append(("alu", ("^", curr_val, curr_val, tmp_node_val)))
+                self.pending_slots.extend(self.build_hash(curr_val, tmp1, tmp2, round, i))
 
-                body.append(("alu", ("^", curr_val, curr_val, tmp_node_val)))
-                body.extend(self.build_hash(curr_val, tmp1, tmp2, round, i))
-                # body.append(("debug", ("compare", curr_val, (round, i, "hashed_val"))))
+                self.pending_slots.append(("alu", ("%", tmp1, curr_val, two_const)))
+                self.pending_slots.append(("alu", ("==", tmp1, tmp1, zero_const)))
+                self.pending_slots.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                self.pending_slots.append(("alu", ("*", curr_idx, curr_idx, two_const)))
+                self.pending_slots.append(("alu", ("+", curr_idx, curr_idx, tmp3)))
 
-                body.append(("alu", ("%", tmp1, curr_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", curr_idx, curr_idx, two_const)))
-                body.append(("alu", ("+", curr_idx, curr_idx, tmp3)))
-                # body.append(("debug", ("compare", curr_idx, (round, i, "next_idx"))))
+                self.pending_slots.append(("alu", ("<", tmp1, curr_idx, self.scratch["n_nodes"])))
+                self.pending_slots.append(("flow", ("select", curr_idx, tmp1, curr_idx, zero_const)))
 
-                body.append(("alu", ("<", tmp1, curr_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", curr_idx, tmp1, curr_idx, zero_const)))
-                # body.append(("debug", ("compare", curr_idx, (round, i, "wrapped_idx"))))
-
-        # Epilogue: Store scratch to mem
         epilogue = []
         for vi in range(vector_loops):
             i = vi * VLEN
@@ -708,10 +606,10 @@ class KernelBuilder:
             epilogue.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
             epilogue.append(("store", ("store", tmp_addr, val_buf + i)))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        self.instrs.extend(self.pack_slots(epilogue))
-        # Required to match with the yield in reference_kernel2
+        self.pending_slots.extend(epilogue)
+
+        # Schedule everything at once
+        self.instrs = self.build(self.pending_slots)
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
@@ -732,7 +630,6 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -758,8 +655,6 @@ def do_kernel_test(
         if prints:
             print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
             print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
@@ -768,9 +663,6 @@ def do_kernel_test(
 
 class Tests(unittest.TestCase):
     def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
@@ -783,34 +675,10 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
-        # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
-
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
