@@ -478,7 +478,7 @@ class KernelBuilder:
         # Just add to pending
         self.pending_slots.extend(prologue)
 
-        PIPELINE_STRIDE = 8
+        PIPELINE_STRIDE = 10
         last_result_vec = [None] * UNROLL_FACTOR
 
         for round in range(rounds):
@@ -505,9 +505,10 @@ class KernelBuilder:
                     prev_u = u - PIPELINE_STRIDE
                     if prev_u >= 0 and last_result_vec[prev_u] is not None:
                          dep_reg = last_result_vec[prev_u]
-                         # Inject a dummy multiply_add: curr = curr + dep * 0
-                         # This forces this round of 'u' to wait for the previous round of 'prev_u' to finish
-                         ops_loads.append(("valu", ("multiply_add", curr_val_vec, dep_reg, zero_vec, curr_val_vec)))
+                         # Inject a dummy ALU add: tmp = dep + 0
+                         # This uses the IDLE 'alu' engine instead of the busy 'valu' engine.
+                         # It reads the first element of the vector dependency, creating a RAW edge.
+                         ops_loads.append(("alu", ("+", tmp1, dep_reg, zero_const)))
 
                     tmp_node_val_u = tmp_node_vals[u]
                     tmp1_u = tmp1s[u]
