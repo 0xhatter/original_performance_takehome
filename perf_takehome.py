@@ -490,12 +490,10 @@ class KernelBuilder:
         inp_values_addr = self.alloc_scratch("inp_values_addr")
 
         # Temp vectors for unrolling
-        UNROLL_FACTOR = 16
+        UNROLL_FACTOR = 32
         tmp_node_vals = [self.alloc_scratch_vec(f"tmp_node_val_{k}") for k in range(UNROLL_FACTOR)]
         tmp1s = [self.alloc_scratch_vec(f"tmp1_{k}") for k in range(UNROLL_FACTOR)]
         tmp3s = [self.alloc_scratch_vec(f"tmp3_{k}") for k in range(UNROLL_FACTOR)]
-        tmp2s = [self.alloc_scratch_vec(f"tmp2_{k}") for k in range(UNROLL_FACTOR)]
-        tmp4s = [self.alloc_scratch_vec(f"tmp4_{k}") for k in range(UNROLL_FACTOR)]
 
         # Address registers for unrolled gather (scalar)
         # Reuse tmp1s as address registers to save space
@@ -539,7 +537,7 @@ class KernelBuilder:
         self.instrs.extend(self.pack_slots(prologue))
 
         # Increase pool size to support up to Round 3 (8 values)
-        mux_pool = [self.alloc_scratch_vec(f"mux_{k}") for k in range(8)]
+        mux_pool = [self.alloc_scratch_vec(f"mux_{k}") for k in range(2)]
         for round in range(rounds):
             eff_round = round % (forest_height + 1)
             # Use Mux for Rounds 0, 1 (and 11, 12)
@@ -579,8 +577,6 @@ class KernelBuilder:
                     tmp_node_val_u = tmp_node_vals[u]
                     tmp1_u = tmp1s[u]
                     tmp3_u = tmp3s[u]
-                    tmp2_u = tmp2s[u]
-                    tmp4_u = tmp4s[u]
 
                     if use_mux:
                         current_vals = list(mux_vals)
@@ -623,8 +619,8 @@ class KernelBuilder:
                             emit_flow_select(dest, dest, R, L)
                             return dest
 
-                        # Available temps: tmp_node_val_u, tmp1_u, tmp2_u, tmp3_u, tmp4_u
-                        regs = [tmp_node_val_u, tmp1_u, tmp2_u, tmp3_u, tmp4_u]
+                        # Available temps: tmp_node_val_u, tmp1_u, tmp3_u
+                        regs = [tmp_node_val_u, tmp1_u, tmp3_u]
 
                         import math
                         top_bit = int(math.log2(len(current_vals))) - 1
@@ -660,7 +656,7 @@ class KernelBuilder:
                     # max_idx at end of round r is roughly 2^(r+1).
                     if (1 << (round + 1)) >= n_nodes:
                         ops_updates.append(("valu", ("<", tmp1_u, curr_idx_vec, n_nodes_vec)))
-                        ops_updates.append(("valu", ("*", curr_idx_vec, curr_idx_vec, tmp1_u)))
+                        ops_updates.append(("flow", ("vselect", curr_idx_vec, tmp1_u, curr_idx_vec, zero_vec)))
 
                 body.extend(ops_addrs)
                 body.extend(ops_loads)
