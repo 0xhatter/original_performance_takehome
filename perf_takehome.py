@@ -266,6 +266,8 @@ class Scheduler:
             # Prioritize LOADs because they are the bottleneck
             if n['engine'] == 'load':
                 n['priority'] += 100000
+            elif n['engine'] == 'valu':
+                n['priority'] += 80000
             elif n['engine'] == 'flow':
                 n['priority'] += 50000
             n['unscheduled_preds'] = len(n['preds'])
@@ -526,12 +528,19 @@ class KernelBuilder:
                             base_const = self.scratch_const_vec(base_val)
 
                             def get_mask(bit_idx, target_reg):
-                                ops_loads.append(("valu", ("-", target_reg, curr_idx_vec, base_const)))
-                                if bit_idx > 0:
-                                    shift_const = self.scratch_const_vec(bit_idx)
-                                    ops_loads.append(("valu", (">>", target_reg, target_reg, shift_const)))
-                                mask_const = self.scratch_const_vec(1)
-                                ops_loads.append(("valu", ("&", target_reg, target_reg, mask_const)))
+                                if bit_idx == 0:
+                                    # Optimization: Bit 0 of (idx - base) is equivalent to (val & 1)
+                                    # This saves subtraction and potential shifting.
+                                    # curr_val_vec holds the value from the previous round (input to this round).
+                                    mask_const = self.scratch_const_vec(1)
+                                    ops_loads.append(("valu", ("&", target_reg, curr_val_vec, mask_const)))
+                                else:
+                                    ops_loads.append(("valu", ("-", target_reg, curr_idx_vec, base_const)))
+                                    # Optimization: Skip shift. Use (1 << bit_idx) mask directly.
+                                    # vselect treats any non-zero value as true.
+                                    mask_val = 1 << bit_idx
+                                    mask_const = self.scratch_const_vec(mask_val)
+                                    ops_loads.append(("valu", ("&", target_reg, target_reg, mask_const)))
 
                             import math
                             depth = int(math.log2(num_vals)) if num_vals > 0 else 0
