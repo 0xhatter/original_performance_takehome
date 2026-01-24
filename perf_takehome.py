@@ -511,8 +511,6 @@ class KernelBuilder:
                     tmp1_u = tmp1s[u]
                     tmp3_u = tmp3s[u]
 
-                    # Available registers: tmp_node_val_u (R0), tmp1_u (R1), tmp3_u (R2)
-
                     if use_mux:
                         base_idx = (1 << eff_round) - 1
                         count = 1 << eff_round
@@ -541,9 +539,6 @@ class KernelBuilder:
                             current_level_vals = vals
 
                             for b in range(0, depth):
-                                # For Round 2 (depth 2), we use Mask Reg R2 (tmp3_u).
-                                # For Round 1 (depth 1), we use Mask Reg R2.
-                                # For Round 0 (depth 0), we don't loop.
                                 mask_reg = regs[2]
                                 get_mask(b, mask_reg)
 
@@ -558,7 +553,7 @@ class KernelBuilder:
                                     new_vals.append(dest)
                                 current_level_vals = new_vals
 
-                            if num_vals == 1:
+                            if len(vals) == 1:
                                 ops_loads.append(("valu", ("+", regs[0], vals[0], zero_vec)))
 
 
