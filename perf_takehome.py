@@ -483,7 +483,7 @@ class KernelBuilder:
 
         for round in range(rounds):
             eff_round = round % (forest_height + 1)
-            # Enable Round 2 Mux with Pipelining!
+            # Enable Mux for Rounds 0, 1, 2
             use_mux = eff_round <= 2
 
             for vui in range(unrolled_loops):
@@ -505,14 +505,13 @@ class KernelBuilder:
                     prev_u = u - PIPELINE_STRIDE
                     if prev_u >= 0 and last_result_vec[prev_u] is not None:
                          dep_reg = last_result_vec[prev_u]
-                         # Inject a dummy ALU add: tmp = dep + 0
-                         # This uses the IDLE 'alu' engine instead of the busy 'valu' engine.
-                         # It reads the first element of the vector dependency, creating a RAW edge.
                          ops_loads.append(("alu", ("+", tmp1, dep_reg, zero_const)))
 
                     tmp_node_val_u = tmp_node_vals[u]
                     tmp1_u = tmp1s[u]
                     tmp3_u = tmp3s[u]
+
+                    # Available registers: tmp_node_val_u (R0), tmp1_u (R1), tmp3_u (R2)
 
                     if use_mux:
                         base_idx = (1 << eff_round) - 1
@@ -522,43 +521,49 @@ class KernelBuilder:
                         def emit_flow_select(dest, mask, a, b):
                             ops_loads.append(("flow", ("vselect", dest, mask, a, b)))
 
-                        def build_select(vals, bit_index, avail_regs):
-                            if len(vals) == 1:
-                                return vals[0]
-
-                            mid = len(vals) // 2
-                            vals0 = vals[:mid]
-                            vals1 = vals[mid:]
-
-                            dest = avail_regs[0]
-                            inner_regs = avail_regs[1:]
-
-                            L = build_select(vals0, bit_index - 1, inner_regs)
-
-                            used_by_L = 1 if len(vals0) > 1 else 0
-                            R = build_select(vals1, bit_index - 1, inner_regs[used_by_L:])
+                        def build_iterative_mux(vals, regs):
+                            num_vals = len(vals)
 
                             base_val = (1 << eff_round) - 1
                             base_const = self.scratch_const_vec(base_val)
 
-                            ops_loads.append(("valu", ("-", dest, curr_idx_vec, base_const)))
-                            if bit_index > 0:
-                                shift_const = self.scratch_const_vec(bit_index)
-                                ops_loads.append(("valu", (">>", dest, dest, shift_const)))
+                            def get_mask(bit_idx, target_reg):
+                                ops_loads.append(("valu", ("-", target_reg, curr_idx_vec, base_const)))
+                                if bit_idx > 0:
+                                    shift_const = self.scratch_const_vec(bit_idx)
+                                    ops_loads.append(("valu", (">>", target_reg, target_reg, shift_const)))
+                                mask_const = self.scratch_const_vec(1)
+                                ops_loads.append(("valu", ("&", target_reg, target_reg, mask_const)))
 
-                            mask_const = self.scratch_const_vec(1)
-                            ops_loads.append(("valu", ("&", dest, dest, mask_const)))
+                            import math
+                            depth = int(math.log2(num_vals)) if num_vals > 0 else 0
 
-                            emit_flow_select(dest, dest, R, L)
-                            return dest
+                            current_level_vals = vals
+
+                            for b in range(0, depth):
+                                # For Round 2 (depth 2), we use Mask Reg R2 (tmp3_u).
+                                # For Round 1 (depth 1), we use Mask Reg R2.
+                                # For Round 0 (depth 0), we don't loop.
+                                mask_reg = regs[2]
+                                get_mask(b, mask_reg)
+
+                                new_vals = []
+                                for k in range(0, len(current_level_vals), 2):
+                                    A = current_level_vals[k+1]
+                                    B = current_level_vals[k]
+                                    dest = regs[k // 2]
+
+                                    emit_flow_select(dest, mask_reg, A, B)
+
+                                    new_vals.append(dest)
+                                current_level_vals = new_vals
+
+                            if num_vals == 1:
+                                ops_loads.append(("valu", ("+", regs[0], vals[0], zero_vec)))
+
 
                         regs = [tmp_node_val_u, tmp1_u, tmp3_u]
-                        import math
-                        top_bit = int(math.log2(len(current_vals))) - 1
-
-                        res = build_select(current_vals, top_bit, regs)
-                        if res != tmp_node_val_u:
-                             ops_loads.append(("valu", ("+", tmp_node_val_u, res, zero_vec)))
+                        build_iterative_mux(current_vals, regs)
 
                     else:
                         for k in range(VLEN):
@@ -595,52 +600,10 @@ class KernelBuilder:
                 t1 = tmp1s[0]
                 t3 = tmp3s[0]
 
-                if use_mux:
-                    base_idx = (1 << eff_round) - 1
-                    count = 1 << eff_round
-                    current_vals = vec_tree_vals[base_idx : base_idx + count]
-
-                    def emit_sel(dest, mask, a, b):
-                        self.pending_slots.append(("flow", ("vselect", dest, mask, a, b)))
-
-                    def bld_sel(vals, bit_index, avail_regs):
-                        if len(vals) == 1: 
-                            return vals[0]
-                        mid = len(vals) // 2
-                        vals0, vals1 = vals[:mid], vals[mid:]
-                        
-                        dest = avail_regs[0]
-                        inner = avail_regs[1:]
-                        
-                        L = bld_sel(vals0, bit_index - 1, inner)
-                        used_by_L = 1 if len(vals0) > 1 else 0
-                        R = bld_sel(vals1, bit_index - 1, inner[used_by_L:])
-                        
-                        base_val = (1 << eff_round) - 1
-                        base_const = self.scratch_const_vec(base_val)
-
-                        self.pending_slots.append(("valu", ("-", dest, curr_idx_vec, base_const)))
-                        if bit_index > 0:
-                            s_const = self.scratch_const_vec(bit_index)
-                            self.pending_slots.append(("valu", (">>", dest, dest, s_const)))
-                        
-                        m_const = self.scratch_const_vec(1)
-                        self.pending_slots.append(("valu", ("&", dest, dest, m_const)))
-                        
-                        emit_sel(dest, dest, R, L)
-                        return dest
-
-                    import math
-                    top_bit = int(math.log2(len(current_vals))) - 1
-                    regs = [t_node, t1, t3]
-                    res = bld_sel(current_vals, top_bit, regs)
-                    if res != t_node:
-                         self.pending_slots.append(("valu", ("+", t_node, res, zero_vec)))
-                else:
-                    for k in range(VLEN):
-                        addr_reg = tmp_addrs_pool[k]
-                        self.pending_slots.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], curr_idx_vec + k)))
-                        self.pending_slots.append(("load", ("load", t_node + k, addr_reg)))
+                for k in range(VLEN):
+                    addr_reg = tmp_addrs_pool[k]
+                    self.pending_slots.append(("alu", ("+", addr_reg, self.scratch["forest_values_p"], curr_idx_vec + k)))
+                    self.pending_slots.append(("load", ("load", t_node + k, addr_reg)))
 
                 self.pending_slots.append(("valu", ("^", curr_val_vec, curr_val_vec, t_node)))
                 self.pending_slots.extend(self.build_hash_vector(curr_val_vec, t1, t3, round, i))
